@@ -17,3 +17,11 @@ __pycache__/
 
 # Previous deployment script versions
 preview-before-status.sh
+
+# Lambda deployment backups and generated packages
+/deployment-backups/
+/app/*.zip
+
+# Local CloudFormation recovery copies
+/deployed-stack-recovered.yaml
+/Brief_C_local_template_backup.yaml

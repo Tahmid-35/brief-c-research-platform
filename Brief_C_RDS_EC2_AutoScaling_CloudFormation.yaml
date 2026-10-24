@@ -434,3 +434,4 @@ Outputs:
   ResearchDbPort: {Value: !GetAtt ResearchMetadataDb.Endpoint.Port}
   ResearchEc2AutoScalingGroupName: {Value: !Ref ResearchEc2AutoScalingGroup}
   ResearchEc2LaunchTemplateId: {Value: !Ref ResearchEc2LaunchTemplate}
+
