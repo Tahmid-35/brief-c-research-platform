@@ -1,0 +1,26 @@
+name: Brief C - Infrastructure Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate CloudFormation YAML
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check cfn-lint
+
+      - name: Validate CloudFormation template
+        run: |
+          cfn-lint -t Brief_C_RDS_EC2_AutoScaling_CloudFormation.yaml
