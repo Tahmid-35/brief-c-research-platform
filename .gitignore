@@ -1,0 +1,19 @@
+.aws/
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*
+*Secret*
+*backup*
+*.bak
+Brief_C_before_*.yaml
+deployed-parameters.json
+submission-package/
+*.zip
+__pycache__/
+.DS_Store
+
+# Previous deployment script versions
+preview-before-status.sh
