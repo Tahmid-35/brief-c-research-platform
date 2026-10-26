@@ -1,0 +1,83 @@
+name: Brief C - Lambda Application Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ false }} # Disabled until reviewed
+    environment: lambda-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test Lambda application
+        run: python -m unittest discover -s tests -v
+
+      - name: Package Lambda
+        run: |
+          cd app
+          zip -q research-processor.zip index.py
+
+      - name: Configure temporary AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Verify deployment baseline
+        run: |
+          STATE=$(aws lambda get-function-configuration --function-name brief-c-research-poc-research-processor --region us-east-1 --query State --output text)
+          UPDATE=$(aws lambda get-function-configuration --function-name brief-c-research-poc-research-processor --region us-east-1 --query LastUpdateStatus --output text)
+          test "$STATE" = "Active"
+          test "$UPDATE" = "Successful"
+      - name: Backup current Lambda package
+        run: |
+          python - <<'BACKUP'
+          import boto3
+          import hashlib
+          import base64
+          import urllib.request
+
+          client = boto3.client('lambda', region_name='us-east-1')
+          response = client.get_function(
+              FunctionName='brief-c-research-poc-research-processor'
+          )
+          package = urllib.request.urlopen(
+              response['Code']['Location'], timeout=30
+          ).read()
+          actual = base64.b64encode(
+              hashlib.sha256(package).digest()
+          ).decode()
+          expected = response['Configuration']['CodeSha256']
+          assert actual == expected, 'Lambda backup hash mismatch'
+          open('lambda-backup.zip', 'wb').write(package)
+          print('PRE-DEPLOYMENT BACKUP VERIFIED')
+          BACKUP
+
+      - name: Preserve rollback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-backup
+          path: lambda-backup.zip
+          retention-days: 7
+      - name: Update Lambda application
+        run: |
+          aws lambda update-function-code \
+            --function-name brief-c-research-poc-research-processor \
+            --zip-file fileb://app/research-processor.zip \
+            --region us-east-1 >/dev/null
+
+          aws lambda wait function-updated \
+            --function-name brief-c-research-poc-research-processor \
+            --region us-east-1
+
+          aws lambda get-function-configuration \
+            --function-name brief-c-research-poc-research-processor \
+            --region us-east-1 \
+            --query '{State:State,LastUpdateStatus:LastUpdateStatus}'
