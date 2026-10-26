@@ -19,7 +19,7 @@ def handler(event,context):
             if not rows: raise ValueError('INVALID_DATA empty CSV')
             try: values=[float(row['value']) for row in rows]
             except (TypeError,ValueError): raise ValueError('INVALID_DATA non-numeric value') from None
-            result={'faculty':faculty,'source_key':key,'records':len(values),'total':sum(values),'mean':sum(values)/len(values)}
+            result={'faculty':faculty,'source_key':key,'records':len(values),'total':sum(values),'mean':sum(values)/len(values),'processor_version':'1.1'}
             s3.put_object(Bucket=os.environ['OUTPUT_BUCKET'],Key=f'{faculty}/{key}.summary.json',Body=json.dumps(result).encode(),ContentType='application/json')
             log.info('PROCESSED faculty=%s key=%s',faculty,key)
         except Exception:
