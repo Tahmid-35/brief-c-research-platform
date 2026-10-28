@@ -1,28 +1,43 @@
-name: Brief C - Lambda Application Deployment
+name: Validate and Deploy Lambda
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  deploy:
-    if: ${{ false }} # Disabled until reviewed
-    environment: lambda-deployment
+  test:
+    name: Test application
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Test Lambda application
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Package Lambda
-        run: |
-          cd app
-          zip -q research-processor.zip index.py
+      - name: Check Python syntax
+        run: python -m py_compile app/index.py
 
-      - name: Configure temporary AWS credentials
+  deploy:
+    name: Deploy Lambda to AWS
+    needs: test
+    runs-on: ubuntu-latest
+    environment: lambda-deployment
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -30,54 +45,23 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: us-east-1
 
-      - name: Verify deployment baseline
+      - name: Confirm AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Package Lambda code
         run: |
-          STATE=$(aws lambda get-function-configuration --function-name brief-c-research-poc-research-processor --region us-east-1 --query State --output text)
-          UPDATE=$(aws lambda get-function-configuration --function-name brief-c-research-poc-research-processor --region us-east-1 --query LastUpdateStatus --output text)
-          test "$STATE" = "Active"
-          test "$UPDATE" = "Successful"
-      - name: Backup current Lambda package
+          test -f app/index.py
+          cd app
+          zip -q -j ../lambda-package.zip index.py
+
+      - name: Deploy Lambda code
         run: |
-          python - <<'BACKUP'
-          import boto3
-          import hashlib
-          import base64
-          import urllib.request
+          aws lambda update-function-code             --function-name brief-c-research-poc-research-processor             --zip-file fileb://lambda-package.zip             --publish
 
-          client = boto3.client('lambda', region_name='us-east-1')
-          response = client.get_function(
-              FunctionName='brief-c-research-poc-research-processor'
-          )
-          package = urllib.request.urlopen(
-              response['Code']['Location'], timeout=30
-          ).read()
-          actual = base64.b64encode(
-              hashlib.sha256(package).digest()
-          ).decode()
-          expected = response['Configuration']['CodeSha256']
-          assert actual == expected, 'Lambda backup hash mismatch'
-          open('lambda-backup.zip', 'wb').write(package)
-          print('PRE-DEPLOYMENT BACKUP VERIFIED')
-          BACKUP
-
-      - name: Preserve rollback artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lambda-backup
-          path: lambda-backup.zip
-          retention-days: 7
-      - name: Update Lambda application
+      - name: Wait for Lambda update
         run: |
-          aws lambda update-function-code \
-            --function-name brief-c-research-poc-research-processor \
-            --zip-file fileb://app/research-processor.zip \
-            --region us-east-1 >/dev/null
+          aws lambda wait function-updated-v2             --function-name brief-c-research-poc-research-processor
 
-          aws lambda wait function-updated \
-            --function-name brief-c-research-poc-research-processor \
-            --region us-east-1
-
-          aws lambda get-function-configuration \
-            --function-name brief-c-research-poc-research-processor \
-            --region us-east-1 \
-            --query '{State:State,LastUpdateStatus:LastUpdateStatus}'
+      - name: Verify deployment
+        run: |
+          aws lambda get-function-configuration             --function-name brief-c-research-poc-research-processor             --query '{FunctionName:FunctionName,Version:Version,State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}'             --output json
