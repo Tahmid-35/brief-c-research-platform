@@ -8,16 +8,18 @@ The PoC includes research file uploads, asynchronous processing, research file m
 
 ## What the template deploys
 
-| Component | Purpose / key configuration |
+
+| Component | Purpose / Key Configuration |
 |---|---|
-Amazon VPC | 10.80.0.0/16; two private subnets, one in each Availability Zone, private route table and S3 gateway endpoint. The private subnet route table has no default internet route.
-Amazon S3 | Multiple input buckets (Science and Medicine) and one output bucket (processed) and S3 encryption and public access disabled. |
-Amazon EventBridge | Sends object-created events to Amazon's research queue from faculty input buckets.
-The Amazon Simple Queueing Service (SQS) is a queue used for processing messages, receiving messages at most failures, and sending them to a DLQ for retry. |
-AWS Lambda | Python 3.12 CSV processor, 256 MB memory, 30-second timeout, that consumes SQS messages and writes the JSON summary to S3.
-Private, encrypted MySQL `db.t3.micro` database that is backed up for 7 days, with managed credentials for the master. |
-Private `t3.micro` launch template, Auto Scaling policy of 60% CPU average, and a minimum of 0 and maximum of 2 instances. To not create an unneeded always-on lab instance, the submitted template has a desired capacity of 0.
-Amazon CloudWatch / SNS, Log group, Processing-error metric filter, Operational dashboard and Processing/DLQ alarms / SNS alert topic.
+| **Amazon VPC** | VPC CIDR `10.80.0.0/16`, with two private subnets across two Availability Zones, a private route table, and an S3 gateway endpoint. The private route table has no default route to the internet. |
+| **Amazon S3** | Separate input buckets for Science and Medicine, plus a shared output bucket for processed results. S3 encryption is enabled, and public access is blocked. |
+| **Amazon EventBridge** | Routes S3 object-created events from the faculty input buckets to the research processing queue. |
+| **Amazon SQS** | Decouples file ingestion from processing. Failed messages are retried according to the queue's redrive policy and moved to a dead-letter queue (DLQ) after exceeding the configured maximum receive count. |
+| **AWS Lambda** | Python 3.12 CSV processor configured with 256 MB of memory and a 30-second timeout. Consumes SQS messages and writes JSON summaries to S3. |
+| **Amazon RDS** | Private, encrypted MySQL database (`db.t3.micro`) with seven-day automated backup retention and database credentials managed through AWS Secrets Manager. |
+| **Amazon EC2 Auto Scaling** | Private EC2 instances launched using a `t3.micro` launch template, with target-tracking scaling at 60% average CPU utilisation. Minimum capacity is 0, maximum capacity is 2, and desired capacity is initially 0 to avoid unnecessary lab costs. |
+| **Amazon CloudWatch / SNS** | CloudWatch log group, processing-error metric filter, operational dashboard, CloudWatch alarms for processing failures and dead-letter queue activity, and an SNS notification topic. |
+
 
 Data flow: S3 (Science/Medicine) → EventBridge → SQS → Lambda → processed S3. If requests fail repeatedly, they may be queued up in the DLQ to be investigated.
 
