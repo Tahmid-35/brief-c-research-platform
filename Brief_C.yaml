@@ -1,0 +1,437 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Brief C research platform PoC - faculty S3, EventBridge, SQS, Lambda and observability
+Parameters:
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for SNS notifications (must confirm subscription)
+  LabRoleName:
+    Type: String
+    Default: LabRole
+    Description: Existing AWS Academy role; cannot create new IAM roles in Learner Lab
+  LatestAmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Public SSM parameter for the latest Amazon Linux 2023 x86_64 AMI
+  EnableVpcLambda:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true only after verifying LabRole EC2 network-interface permissions
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  UseVpcLambda: !Equals [!Ref EnableVpcLambda, 'true']
+Resources:
+  # Private lab VPC for demonstrating a backend network boundary; no public routes.
+  ResearchVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.80.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: brief-c-private-vpc}]
+  # Private subnet in AZ 1; no internet gateway or NAT route.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ResearchVpc
+      CidrBlock: 10.80.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+  # Private subnet in AZ 2; provides a second placement zone.
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ResearchVpc
+      CidrBlock: 10.80.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+  # Private route table for S3 gateway endpoint traffic.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref ResearchVpc}
+  # Associate AZ 1 subnet with private route table.
+  RouteAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  # Associate AZ 2 subnet with private route table.
+  RouteAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+  # Gateway endpoint enables private S3 access without NAT charges.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ResearchVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds: [!Ref PrivateRouteTable]
+  # Security group for optional VPC-attached Lambda processing.
+  ProcessorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound traffic; outbound HTTPS only
+      VpcId: !Ref ResearchVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  # Science faculty storage with encryption and all public access blocked.
+  ScienceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}
+      NotificationConfiguration: {EventBridgeConfiguration: {EventBridgeEnabled: true}}
+      LifecycleConfiguration:
+        Rules: [{Id: ExpireNoncurrentTestVersions, Status: Enabled, NoncurrentVersionExpiration: {NoncurrentDays: 7}}]
+  # Medicine faculty storage with matching protection and event routing.
+  MedicineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}
+      NotificationConfiguration: {EventBridgeConfiguration: {EventBridgeEnabled: true}}
+      LifecycleConfiguration:
+        Rules: [{Id: ExpireNoncurrentTestVersions, Status: Enabled, NoncurrentVersionExpiration: {NoncurrentDays: 7}}]
+  # Processed result storage with faculty-specific output prefixes.
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+  # Queue holding messages that repeatedly fail processing.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 1209600, SqsManagedSseEnabled: true}
+  # Main processing queue; failed messages go to DLQ after three receives.
+  ResearchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn, maxReceiveCount: 3}
+  # EventBridge rule forwards only new objects from the two faculty buckets.
+  UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref ScienceBucket, !Ref MedicineBucket]
+      State: ENABLED
+      Targets: [{Id: ResearchQueue, Arn: !GetAtt ResearchQueue.Arn}]
+  # SQS policy permits only this EventBridge rule to submit queue messages.
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ResearchQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt ResearchQueue.Arn
+            Condition: {ArnEquals: {'aws:SourceArn': !GetAtt UploadRule.Arn}}
+  # CloudWatch log group with short PoC retention.
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-research-processor'
+      RetentionInDays: 7
+  # Lambda validates faculty CSV files and writes a summary to processed S3.
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-research-processor'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Environment:
+        Variables:
+          SCIENCE_BUCKET: !Ref ScienceBucket
+          MEDICINE_BUCKET: !Ref MedicineBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+      VpcConfig: !If
+        - UseVpcLambda
+        - {SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB], SecurityGroupIds: [!Ref ProcessorSecurityGroup]}
+        - !Ref AWS::NoValue
+      Code:
+        ZipFile: |
+          import csv,io,json,logging,os,boto3
+          from urllib.parse import unquote_plus
+          log=logging.getLogger(); log.setLevel(logging.INFO)
+          s3=boto3.client('s3')
+          def handler(event,context):
+              failed=[]
+              for record in event.get('Records',[]):
+                  try:
+                      msg=json.loads(record['body'])
+                      if msg.get('source')!='aws.s3' or msg.get('detail-type')!='Object Created': raise ValueError('INVALID_DATA unexpected event')
+                      detail=msg['detail']; bucket=detail['bucket']['name']; key=unquote_plus(detail['object']['key'])
+                      allowed={'science':os.environ['SCIENCE_BUCKET'],'medicine':os.environ['MEDICINE_BUCKET']}
+                      faculty=next((f for f,b in allowed.items() if b==bucket),None)
+                      if not faculty or not key.lower().endswith('.csv'): raise ValueError('INVALID_DATA invalid faculty or file type')
+                      data=s3.get_object(Bucket=bucket,Key=key)['Body'].read().decode('utf-8-sig')
+                      reader=csv.DictReader(io.StringIO(data))
+                      if not reader.fieldnames or 'value' not in reader.fieldnames: raise ValueError('INVALID_DATA missing value column')
+                      rows=list(reader)
+                      if not rows: raise ValueError('INVALID_DATA empty CSV')
+                      try: values=[float(row['value']) for row in rows]
+                      except (TypeError,ValueError): raise ValueError('INVALID_DATA non-numeric value') from None
+                      result={'faculty':faculty,'source_key':key,'records':len(values),'total':sum(values),'mean':sum(values)/len(values),'processor_version':'1.1'}
+                      s3.put_object(Bucket=os.environ['OUTPUT_BUCKET'],Key=f'{faculty}/{key}.summary.json',Body=json.dumps(result).encode(),ContentType='application/json')
+                      log.info('PROCESSED faculty=%s key=%s',faculty,key)
+                  except Exception:
+                      log.exception('PROCESSING_ERROR messageId=%s',record['messageId'])
+                      failed.append({'itemIdentifier':record['messageId']})
+              return {'batchItemFailures':failed}
+  # Poll SQS with partial batch failure reporting and limited concurrency.
+  QueueEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ResearchQueue.Arn
+      FunctionName: !Ref ProcessorFunction
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig: {MaximumConcurrency: 2}
+      Enabled: true
+  # SNS topic used by both operational alarms.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties: {DisplayName: Brief C PoC Alerts}
+  # Optional email subscription; recipient must confirm the AWS email.
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+  # Convert application error log lines into a countable CloudWatch metric.
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: 'PROCESSING_ERROR'
+      MetricTransformations:
+        - MetricNamespace: BriefC/Research
+          MetricName: ProcessingErrors
+          MetricValue: '1'
+  # Alert when Lambda has at least one error in a five-minute window.
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda invocation errors (not caught per-message errors)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ProcessorFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  # Alert on the metric filter when application processing reports failures.
+  ProcessingErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Application-level processing errors
+      Namespace: BriefC/Research
+      MetricName: ProcessingErrors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  # Alert when one or more failed messages are visible in the DLQ.
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Failed research job waiting in dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  # Operational dashboard with six processing and queue metrics.
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-operations'
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Lambda invocations / errors","region":"${AWS::Region}","metrics":[["AWS/Lambda","Invocations","FunctionName","${ProcessorFunction}"],["AWS/Lambda","Errors","FunctionName","${ProcessorFunction}"]],"stat":"Sum","period":60}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda duration","region":"${AWS::Region}","metrics":[["AWS/Lambda","Duration","FunctionName","${ProcessorFunction}"]],"stat":"Average","period":60}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"SQS visible messages / oldest age","region":"${AWS::Region}","metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${ResearchQueue.QueueName}"],["AWS/SQS","ApproximateAgeOfOldestMessage","QueueName","${ResearchQueue.QueueName}"]],"period":60}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"DLQ visible messages","region":"${AWS::Region}","metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${DeadLetterQueue.QueueName}"]],"period":60}}
+        ]}
+  # RDS uses two private subnets across separate Availability Zones.
+  ResearchDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for Brief C MySQL research metadata
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+  # No inbound rules by default. Add a narrowly scoped MySQL rule after
+  # defining and testing the authorized EC2 application security group.
+  ResearchDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private RDS MySQL - ingress intentionally closed pending EC2 tier
+      VpcId: !Ref ResearchVpc
+      SecurityGroupIngress: []
+  # Restrict private MySQL access to EC2 instances using the research application security group.
+  ResearchDbMysqlIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ResearchDbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref ResearchEc2SecurityGroup
+
+  # Encrypted private MySQL database with managed master credentials and seven-day backups.
+  ResearchMetadataDb:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-research-db'
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      StorageType: gp3
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref ResearchDbSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt ResearchDbSecurityGroup.GroupId
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      EnablePerformanceInsights: false
+      MonitoringInterval: 0
+      Tags:
+        - Key: Project
+          Value: BriefC
+        - Key: Environment
+          Value: LearnerLabPoC
+
+  # EC2 tier remains private; no inbound SSH, HTTP, or MySQL rules.
+  ResearchEc2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private Brief C research EC2 instances - no inbound access
+      VpcId: !Ref ResearchVpc
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: BriefC
+  # No internet-dependent UserData. No public IP addresses.
+  ResearchEc2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-research-ec2'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmazonLinuxAmi
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups: [!GetAtt ResearchEc2SecurityGroup.GroupId]
+            DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-research-worker'
+              - Key: Project
+                Value: BriefC
+  # Spread workers across the two existing private subnets.
+  ResearchEc2AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '0'
+      DesiredCapacity: '0'
+      MaxSize: '2'
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ResearchEc2LaunchTemplate
+        Version: !GetAtt ResearchEc2LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Project
+          Value: BriefC
+          PropagateAtLaunch: true
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-research-worker'
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT0S
+  # Target tracking enables automatic scale-out/in if CPU load changes.
+  ResearchEc2CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ResearchEc2AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+        DisableScaleIn: false
+
+Outputs:
+  ScienceBucketName: {Value: !Ref ScienceBucket}
+  MedicineBucketName: {Value: !Ref MedicineBucket}
+  ProcessedBucketName: {Value: !Ref OutputBucket}
+  ResearchQueueUrl: {Value: !Ref ResearchQueue}
+  DeadLetterQueueUrl: {Value: !Ref DeadLetterQueue}
+  DashboardName: {Value: !Ref OperationsDashboard}
+  VpcId: {Value: !Ref ResearchVpc}
+  ResearchDbEndpoint: {Value: !GetAtt ResearchMetadataDb.Endpoint.Address}
+  ResearchDbPort: {Value: !GetAtt ResearchMetadataDb.Endpoint.Port}
+  ResearchEc2AutoScalingGroupName: {Value: !Ref ResearchEc2AutoScalingGroup}
+  ResearchEc2LaunchTemplateId: {Value: !Ref ResearchEc2LaunchTemplate}
+
